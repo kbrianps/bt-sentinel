@@ -1,0 +1,13 @@
+[Unit]
+Description=Bluetooth Sentinel - audio watchdog for PipeWire/BlueZ
+After=pipewire.service wireplumber.service bluetooth.target
+Wants=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/bt-sentinel -d
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

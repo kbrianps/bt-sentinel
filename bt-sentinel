@@ -1,0 +1,288 @@
+#!/bin/bash
+
+set -euo pipefail
+
+VERSION="0.1.0"
+POLL_INTERVAL="${BT_SENTINEL_INTERVAL:-5}"
+RECONNECT_DELAY="${BT_SENTINEL_RECONNECT_DELAY:-2}"
+MAX_RETRIES="${BT_SENTINEL_MAX_RETRIES:-3}"
+VERBOSE="${BT_SENTINEL_VERBOSE:-0}"
+OOB_THRESHOLD="${BT_SENTINEL_OOB_THRESHOLD:-3}"
+COOLDOWN="${BT_SENTINEL_COOLDOWN:-30}"
+
+declare -A LAST_RECONNECT
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+debug() {
+  [[ "$VERBOSE" -eq 1 ]] && log "[DEBUG] $1"
+}
+
+usage() {
+  cat <<EOF
+bt-sentinel v${VERSION}
+Bluetooth watchdog for Linux (PipeWire/BlueZ)
+
+Monitors and fixes common Bluetooth audio issues:
+  1. Silent headphones caused by PipeWire node error state
+  2. Silent headphones caused by WirePlumber buffer exhaustion
+  3. Paired device not reconnecting after switching from another device
+
+Usage: bt-sentinel [OPTIONS]
+
+Options:
+  -d, --daemon        Run in daemon mode (continuous monitoring)
+  -i, --interval SEC  Polling interval in seconds (default: 5)
+  -v, --verbose       Enable verbose logging
+  -h, --help          Show this help message
+  --version           Show version
+
+Environment variables:
+  BT_SENTINEL_INTERVAL        Polling interval in seconds (default: 5)
+  BT_SENTINEL_RECONNECT_DELAY Delay between disconnect/connect (default: 2)
+  BT_SENTINEL_MAX_RETRIES     Max reconnection attempts (default: 3)
+  BT_SENTINEL_OOB_THRESHOLD   Out-of-buffers count to trigger fix (default: 3)
+  BT_SENTINEL_COOLDOWN        Seconds between reconnects per device (default: 30)
+EOF
+}
+
+check_dependencies() {
+  local missing=()
+  for cmd in bluetoothctl wpctl pw-cli journalctl; do
+    if ! command -v "$cmd" &>/dev/null; then
+      missing+=("$cmd")
+    fi
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    log "[ERROR] Missing dependencies: ${missing[*]}"
+    log "Install: sudo apt install bluez pipewire wireplumber systemd"
+    exit 1
+  fi
+}
+
+in_cooldown() {
+  local mac="$1"
+  local now last
+  now=$(date +%s)
+  last="${LAST_RECONNECT[$mac]:-0}"
+  (( now - last < COOLDOWN ))
+}
+
+mark_reconnected() {
+  local mac="$1"
+  LAST_RECONNECT[$mac]=$(date +%s)
+}
+
+get_paired_devices() {
+  bluetoothctl devices Paired 2>/dev/null | awk '{print $2}'
+}
+
+get_connected_devices() {
+  bluetoothctl devices Connected 2>/dev/null | awk '{print $2}'
+}
+
+get_device_name() {
+  local mac="$1"
+  bluetoothctl info "$mac" 2>/dev/null | grep -m1 "Alias:" | sed 's/.*Alias: //'
+}
+
+is_audio_device() {
+  local mac="$1"
+  bluetoothctl info "$mac" 2>/dev/null | grep -q "Audio Sink\|Audio Source\|Handsfree\|Advanced Audio"
+}
+
+is_trusted() {
+  local mac="$1"
+  bluetoothctl info "$mac" 2>/dev/null | grep -q "Trusted: yes"
+}
+
+mac_to_pw_name() {
+  local mac="$1"
+  echo "bluez_output.${mac//:/_}"
+}
+
+get_bt_sink_id() {
+  local mac="$1"
+  local pw_name
+  pw_name=$(mac_to_pw_name "$mac")
+  wpctl status 2>/dev/null | grep -E "${pw_name}" | grep -oP '^\s*\K[0-9]+' | head -1
+}
+
+get_bt_node_state() {
+  local sink_id="$1"
+  pw-cli info "$sink_id" 2>/dev/null | grep -oP 'state:\s*"\K[^"]+' || echo "unknown"
+}
+
+check_node_error() {
+  local mac="$1"
+  local sink_id
+  sink_id=$(get_bt_sink_id "$mac")
+
+  if [[ -z "$sink_id" ]]; then
+    return 1
+  fi
+
+  local state
+  state=$(get_bt_node_state "$sink_id")
+  debug "Node $sink_id state: $state"
+
+  [[ "$state" == "error" ]]
+}
+
+check_out_of_buffers() {
+  local mac="$1"
+
+  local sink_id
+  sink_id=$(get_bt_sink_id "$mac")
+  [[ -z "$sink_id" ]] && return 1
+
+  local oob_count
+  oob_count=$(journalctl --user -u wireplumber --since "-${COOLDOWN}s" --no-pager 2>/dev/null \
+    | grep -c "out of buffers" || true)
+
+  debug "Out-of-buffers count (last ${COOLDOWN}s): $oob_count"
+
+  [[ "$oob_count" -ge "$OOB_THRESHOLD" ]]
+}
+
+check_pipewire_error_log() {
+  local mac="$1"
+  local pw_name
+  pw_name=$(mac_to_pw_name "$mac")
+
+  local error_count
+  error_count=$(journalctl --user -u pipewire --since "-${COOLDOWN}s" --no-pager 2>/dev/null \
+    | grep -c "error\|Error" || true)
+
+  local node_errors
+  node_errors=$(journalctl --user -u pipewire --since "-${COOLDOWN}s" --no-pager 2>/dev/null \
+    | grep -c "${pw_name}.*error" || true)
+
+  debug "PipeWire errors (last ${COOLDOWN}s): general=$error_count node=$node_errors"
+
+  [[ "$node_errors" -ge 1 ]]
+}
+
+reconnect_device() {
+  local mac="$1"
+  local reason="${2:-unknown}"
+  local name
+  name=$(get_device_name "$mac")
+
+  if in_cooldown "$mac"; then
+    debug "Skipping $name ($mac) - in cooldown"
+    return 0
+  fi
+
+  local attempt=0
+  while [[ $attempt -lt $MAX_RETRIES ]]; do
+    attempt=$((attempt + 1))
+    log "[RECONNECT] $name ($mac) - reason: $reason - attempt $attempt/$MAX_RETRIES"
+
+    bluetoothctl disconnect "$mac" &>/dev/null || true
+    sleep "$RECONNECT_DELAY"
+
+    if bluetoothctl connect "$mac" 2>/dev/null | grep -q "successful"; then
+      log "[OK] $name ($mac) reconnected"
+      mark_reconnected "$mac"
+      return 0
+    fi
+
+    sleep "$RECONNECT_DELAY"
+  done
+
+  log "[FAIL] $name ($mac) - could not reconnect after $MAX_RETRIES attempts"
+  mark_reconnected "$mac"
+  return 1
+}
+
+fix_broken_audio() {
+  local connected
+  connected=$(get_connected_devices)
+
+  for mac in $connected; do
+    is_audio_device "$mac" || continue
+
+    local name
+    name=$(get_device_name "$mac")
+
+    if check_node_error "$mac"; then
+      log "[DETECTED] Node error on $name ($mac)"
+      reconnect_device "$mac" "node-error"
+    elif check_out_of_buffers "$mac"; then
+      log "[DETECTED] Buffer exhaustion on $name ($mac)"
+      reconnect_device "$mac" "out-of-buffers"
+    elif check_pipewire_error_log "$mac"; then
+      log "[DETECTED] PipeWire error log for $name ($mac)"
+      reconnect_device "$mac" "pipewire-error-log"
+    else
+      debug "Audio OK for $name"
+    fi
+  done
+}
+
+try_reconnect_missing() {
+  local paired connected
+  paired=$(get_paired_devices)
+  connected=$(get_connected_devices)
+
+  for mac in $paired; do
+    is_audio_device "$mac" || continue
+    is_trusted "$mac" || continue
+
+    if ! echo "$connected" | grep -q "$mac"; then
+      local name
+      name=$(get_device_name "$mac")
+      debug "Paired but disconnected: $name ($mac)"
+
+      if bluetoothctl connect "$mac" 2>/dev/null | grep -q "successful"; then
+        log "[CONNECTED] $name ($mac) - auto-reconnected"
+      else
+        debug "Could not reach $name ($mac) - device may be off or paired elsewhere"
+      fi
+    fi
+  done
+}
+
+run_once() {
+  debug "Running single check..."
+  fix_broken_audio
+  try_reconnect_missing
+}
+
+run_daemon() {
+  log "bt-sentinel v${VERSION} started (interval: ${POLL_INTERVAL}s)"
+  trap 'log "bt-sentinel stopped"; exit 0' SIGTERM SIGINT
+
+  while true; do
+    run_once
+    sleep "$POLL_INTERVAL"
+  done
+}
+
+main() {
+  local daemon=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d|--daemon) daemon=1; shift ;;
+      -i|--interval) POLL_INTERVAL="$2"; shift 2 ;;
+      -v|--verbose) VERBOSE=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --version) echo "bt-sentinel v${VERSION}"; exit 0 ;;
+      *) echo "Unknown option: $1"; usage; exit 1 ;;
+    esac
+  done
+
+  check_dependencies
+
+  if [[ $daemon -eq 1 ]]; then
+    run_daemon
+  else
+    run_once
+  fi
+}
+
+main "$@"
