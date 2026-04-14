@@ -109,7 +109,11 @@ get_bt_sink_id() {
   local mac="$1"
   local pw_name
   pw_name=$(mac_to_pw_name "$mac")
-  wpctl status 2>/dev/null | grep -E "${pw_name}" | grep -oP '^\s*\K[0-9]+' | head -1
+
+  pw-cli ls Node 2>/dev/null | awk -v target="$pw_name" '
+    /^\tid [0-9]+/ { id = $2; sub(",", "", id) }
+    $0 ~ "node.name = \"" target { print id; exit }
+  '
 }
 
 get_bt_node_state() {
