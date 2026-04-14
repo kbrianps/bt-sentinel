@@ -4,9 +4,16 @@ Bluetooth audio watchdog for Linux. Monitors and automatically fixes common Blue
 
 ## Problems it solves
 
-1. **Silent headphones** - Headphones are connected but no audio comes through. Caused by PipeWire node entering error state or WirePlumber running out of audio buffers. Usually requires manually disconnecting and reconnecting.
+1. **Silent headphones** - Headphones are connected but no audio comes through. Caused by PipeWire node entering error state or WirePlumber running out of audio buffers (`out of buffers on port 0 2` in the journal). Usually requires manually disconnecting and reconnecting.
 
 2. **Failed reconnection after device switch** - After using headphones on another device (phone, Windows, etc.), Linux fails to reconnect even after the headphones are available again.
+
+## Tested with
+
+- QCY T13 (no multipoint)
+- Ubuntu 24.04 + PipeWire 1.0.5 + WirePlumber 1.0.5 + BlueZ 5.72
+
+Other BT audio devices and distributions should also work, but have not been validated.
 
 ## Requirements
 
@@ -105,4 +112,4 @@ journalctl --user -u bt-sentinel -f
 
 ## License
 
-MIT
+GPL-3.0
