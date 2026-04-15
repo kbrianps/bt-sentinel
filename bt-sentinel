@@ -2,15 +2,19 @@
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 POLL_INTERVAL="${BT_SENTINEL_INTERVAL:-5}"
 RECONNECT_DELAY="${BT_SENTINEL_RECONNECT_DELAY:-2}"
-MAX_RETRIES="${BT_SENTINEL_MAX_RETRIES:-3}"
+MAX_RETRIES="${BT_SENTINEL_MAX_RETRIES:-2}"
 VERBOSE="${BT_SENTINEL_VERBOSE:-0}"
 OOB_THRESHOLD="${BT_SENTINEL_OOB_THRESHOLD:-3}"
 COOLDOWN="${BT_SENTINEL_COOLDOWN:-30}"
+KEY_SYNC_FAILURE_THRESHOLD="${BT_SENTINEL_KEY_SYNC_THRESHOLD:-1}"
+SCAN_DURATION="${BT_SENTINEL_SCAN_DURATION:-30}"
+AUTO_REPAIR="${BT_SENTINEL_AUTO_REPAIR:-1}"
 
 declare -A LAST_RECONNECT
+declare -A CONNECT_FAILURES
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
@@ -31,6 +35,7 @@ Monitors and fixes common Bluetooth audio issues:
   1. Silent headphones caused by PipeWire node error state
   2. Silent headphones caused by WirePlumber buffer exhaustion
   3. Paired device not reconnecting after switching from another device
+  4. Auto-repair after key desync (remove + re-pair with notification)
 
 Usage: bt-sentinel [OPTIONS]
 
@@ -47,6 +52,9 @@ Environment variables:
   BT_SENTINEL_MAX_RETRIES     Max reconnection attempts (default: 3)
   BT_SENTINEL_OOB_THRESHOLD   Out-of-buffers count to trigger fix (default: 3)
   BT_SENTINEL_COOLDOWN        Seconds between reconnects per device (default: 30)
+  BT_SENTINEL_KEY_SYNC_THRESHOLD  Failures before auto-repair (default: 3)
+  BT_SENTINEL_SCAN_DURATION   Scan timeout when repairing (default: 30s)
+  BT_SENTINEL_AUTO_REPAIR     Enable auto remove+pair (default: 1)
 EOF
 }
 
@@ -171,6 +179,80 @@ check_pipewire_error_log() {
   [[ "$node_errors" -ge 1 ]]
 }
 
+notify() {
+  local title="$1"
+  local body="$2"
+  local urgency="${3:-normal}"
+
+  if command -v notify-send &>/dev/null; then
+    notify-send -u "$urgency" -i bluetooth "$title" "$body" 2>/dev/null || true
+  fi
+}
+
+is_key_sync_error() {
+  local output="$1"
+  echo "$output" | grep -qE "br-connection-unknown|br-connection-canceled|Protocol not available|Authentication Failed"
+}
+
+auto_repair_device() {
+  local mac="$1"
+  local name
+  name=$(get_device_name "$mac")
+  [[ -z "$name" ]] && name="$mac"
+
+  log "[AUTO-REPAIR] Starting for $name ($mac)"
+  notify "Bluetooth key desync" "Put $name in pairing mode to auto-pair" "critical"
+
+  bluetoothctl disconnect "$mac" &>/dev/null || true
+  sleep 1
+  bluetoothctl remove "$mac" &>/dev/null || true
+  sleep 2
+
+  log "[AUTO-REPAIR] Scanning for up to $SCAN_DURATION seconds..."
+  bluetoothctl --timeout "$SCAN_DURATION" scan on &>/dev/null &
+  local scan_pid=$!
+
+  local waited=0
+  local found=0
+  while [[ $waited -lt $SCAN_DURATION ]]; do
+    if bluetoothctl devices 2>/dev/null | grep -q "$mac"; then
+      found=1
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  kill "$scan_pid" 2>/dev/null || true
+  wait "$scan_pid" 2>/dev/null || true
+  bluetoothctl scan off &>/dev/null || true
+
+  if [[ $found -eq 0 ]]; then
+    log "[AUTO-REPAIR] Timed out - device not in pairing mode"
+    notify "Bluetooth auto-repair failed" "$name not found. Put it in pairing mode and retry." "critical"
+    unset "CONNECT_FAILURES[$mac]"
+    return 1
+  fi
+
+  log "[AUTO-REPAIR] Device found, attempting pair"
+  if bluetoothctl pair "$mac" 2>/dev/null | grep -q "successful"; then
+    bluetoothctl trust "$mac" &>/dev/null || true
+    sleep 1
+    if bluetoothctl connect "$mac" 2>/dev/null | grep -q "successful"; then
+      log "[AUTO-REPAIR] Success for $name ($mac)"
+      notify "Bluetooth repaired" "$name paired and connected" "normal"
+      unset "CONNECT_FAILURES[$mac]"
+      mark_reconnected "$mac"
+      return 0
+    fi
+  fi
+
+  log "[AUTO-REPAIR] Failed for $name ($mac)"
+  notify "Bluetooth auto-repair failed" "Could not re-pair $name" "critical"
+  unset "CONNECT_FAILURES[$mac]"
+  return 1
+}
+
 reconnect_device() {
   local mac="$1"
   local reason="${2:-unknown}"
@@ -183,6 +265,7 @@ reconnect_device() {
   fi
 
   local attempt=0
+  local last_output=""
   while [[ $attempt -lt $MAX_RETRIES ]]; do
     attempt=$((attempt + 1))
     log "[RECONNECT] $name ($mac) - reason: $reason - attempt $attempt/$MAX_RETRIES"
@@ -190,9 +273,11 @@ reconnect_device() {
     bluetoothctl disconnect "$mac" &>/dev/null || true
     sleep "$RECONNECT_DELAY"
 
-    if bluetoothctl connect "$mac" 2>/dev/null | grep -q "successful"; then
+    last_output=$(bluetoothctl connect "$mac" 2>&1 || true)
+    if echo "$last_output" | grep -q "successful"; then
       log "[OK] $name ($mac) reconnected"
       mark_reconnected "$mac"
+      unset "CONNECT_FAILURES[$mac]"
       return 0
     fi
 
@@ -201,6 +286,18 @@ reconnect_device() {
 
   log "[FAIL] $name ($mac) - could not reconnect after $MAX_RETRIES attempts"
   mark_reconnected "$mac"
+
+  if is_key_sync_error "$last_output"; then
+    local failures="${CONNECT_FAILURES[$mac]:-0}"
+    failures=$((failures + 1))
+    CONNECT_FAILURES[$mac]=$failures
+    log "[KEY-SYNC] $name ($mac) connection failures: $failures/$KEY_SYNC_FAILURE_THRESHOLD"
+
+    if [[ "$AUTO_REPAIR" -eq 1 && $failures -ge $KEY_SYNC_FAILURE_THRESHOLD ]]; then
+      auto_repair_device "$mac"
+    fi
+  fi
+
   return 1
 }
 
@@ -243,8 +340,20 @@ try_reconnect_missing() {
       name=$(get_device_name "$mac")
       debug "Paired but disconnected: $name ($mac)"
 
-      if bluetoothctl connect "$mac" 2>/dev/null | grep -q "successful"; then
+      local output
+      output=$(bluetoothctl connect "$mac" 2>&1 || true)
+      if echo "$output" | grep -q "successful"; then
         log "[CONNECTED] $name ($mac) - auto-reconnected"
+        unset "CONNECT_FAILURES[$mac]"
+      elif is_key_sync_error "$output"; then
+        local failures="${CONNECT_FAILURES[$mac]:-0}"
+        failures=$((failures + 1))
+        CONNECT_FAILURES[$mac]=$failures
+        log "[KEY-SYNC] $name ($mac) connection failures: $failures/$KEY_SYNC_FAILURE_THRESHOLD"
+
+        if [[ "$AUTO_REPAIR" -eq 1 && $failures -ge $KEY_SYNC_FAILURE_THRESHOLD ]]; then
+          auto_repair_device "$mac"
+        fi
       else
         debug "Could not reach $name ($mac) - device may be off or paired elsewhere"
       fi

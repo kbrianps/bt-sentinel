@@ -8,6 +8,8 @@ Bluetooth audio watchdog for Linux. Monitors and automatically fixes common Blue
 
 2. **Failed reconnection after device switch** - After using headphones on another device (phone, Windows, etc.), Linux fails to reconnect even after the headphones are available again.
 
+3. **Key desync after switching between OSes (dual-boot)** - After pairing the same device on both Linux and Windows, the pairing key on one side becomes invalid. Connection attempts fail with `br-connection-unknown` or `br-connection-canceled`. bt-sentinel detects repeated failures, removes the pairing, scans, and auto-pairs again once the device enters pairing mode. A desktop notification asks you to put the device in pairing mode.
+
 ## Tested with
 
 - QCY T13 (no multipoint)
